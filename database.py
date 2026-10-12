@@ -1,24 +1,15 @@
-"""Local SQLite database for Game Bug Tester System.
-
-Stores user accounts (Tester / Developer) with secure password hashing.
-Uses only Python built-in modules: sqlite3, hashlib, os, datetime.
-
-Database file: game_tracker.db
-Table: users (id, username, password_hash, full_name, email, role, created_at)
-"""
-
 import sqlite3
 import hashlib
 import os
 from datetime import datetime
 
 DB_NAME = "game_tracker.db"
-LEGACY_DB = "game.tracker.db"  # old file with plaintext passwords, kept as backup source
+LEGACY_DB = "game.tracker.db"  
 
 VALID_ROLES = ("Tester", "Developer")
 
 
-# ---------- Password hashing (secure, no extra dependencies) ----------
+
 
 def hash_password(password):
     """Create a salted hash: 'salt_hex$hash_hex' using PBKDF2-HMAC-SHA256."""
@@ -38,7 +29,6 @@ def verify_password(stored_hash, password):
         return False
 
 
-# ---------- Connection ----------
 
 def get_connection():
     """Open a connection to the local database file."""
@@ -46,7 +36,7 @@ def get_connection():
     return conn
 
 
-# ---------- Init (auto-create, preserve records) ----------
+
 
 def init_database():
     """Create game_tracker.db and users table if they do not exist.
@@ -70,7 +60,7 @@ def init_database():
         )
     """)
 
-    # Keep bugs table available so the new file can fully replace the old one later.
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bugs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +95,7 @@ def _migrate_legacy_users(conn):
         rows = old_cur.execute("SELECT username, password, role FROM users").fetchall()
         old_conn.close()
     except sqlite3.Error:
-        return  # old file missing table, etc. -> skip migration
+        return  
 
     cursor = conn.cursor()
     for username, password, role in rows:
@@ -121,11 +111,11 @@ def _migrate_legacy_users(conn):
             )
 
 
-# Backwards-friendly alias
+
 init_db = init_database
 
 
-# ---------- Validation ----------
+
 
 def _validate_inputs(username, password, role, email=""):
     """Return an error message string if invalid, else None."""
@@ -145,7 +135,7 @@ def _validate_inputs(username, password, role, email=""):
     return None
 
 
-# ---------- Register / retrieve / login ----------
+
 
 def register_user(username, password, role, full_name="", email=""):
     """Save a new user permanently. Returns (True/False, message).
@@ -154,7 +144,7 @@ def register_user(username, password, role, full_name="", email=""):
     """
     username = (username or "").strip()
     full_name = (full_name or "").strip()
-    email = (email or "").strip() or None  # store empty email as NULL
+    email = (email or "").strip() or None  
 
     error = _validate_inputs(username, password, role, email or "")
     if error:
@@ -229,7 +219,7 @@ def validate_login(username, password):
     return None, None
 
 
-# Aliases so existing code can switch over with a one-line import change
+
 login = validate_login
 get_user = get_user_by_username
 

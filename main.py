@@ -1,8 +1,15 @@
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
+import uuid
 from datetime import datetime
+from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 import customtkinter as ctk
+from PIL import Image
 from bug_report_form import BugReportForm
 from bug_report_list import BugReportList
 from developer_bug_inbox import DeveloperBugInbox
@@ -11,6 +18,8 @@ from tester_dashboard import build_tester_dashboard
 
 
 DB_FILE = "game.tracker.db"
+APP_DIR = Path(__file__).resolve().parent
+SCREENSHOT_DIR = APP_DIR / "uploads" / "bug_screenshots"
 
 # Color palette
 BG_NAVY = "#0B1120"
@@ -399,6 +408,7 @@ def submit_bug_report(
     if severity not in ("Low", "Medium", "High", "Critical"):
         return False, "Choose a valid severity.", None
 
+    stored_screenshot = None
     conn = sqlite3.connect(DB_FILE)
     try:
         cursor = conn.cursor()
@@ -414,6 +424,14 @@ def submit_bug_report(
         developer = game[0]
         if not _user_has_role(cursor, developer, "Developer"):
             return False, "The game's owning Developer account is unavailable.", None
+        screenshot_db_path = None
+        if screenshot_path:
+            try:
+                stored_screenshot, screenshot_db_path = _store_bug_screenshot(
+                    screenshot_path
+                )
+            except (OSError, ValueError) as error:
+                return False, f"Could not save screenshot: {error}", None
         cursor.execute("""
             INSERT INTO bugs (
                 tester, title, severity, description, screenshot, status,
@@ -422,7 +440,7 @@ def submit_bug_report(
             )
             VALUES (?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?, ?, ?)
         """, (
-            tester, title, severity, description, screenshot_path, game_id,
+            tester, title, severity, description, screenshot_db_path, game_id,
             developer, steps_to_reproduce, expected_result, actual_result,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ))
@@ -430,9 +448,75 @@ def submit_bug_report(
         return True, "Bug report submitted.", cursor.lastrowid
     except sqlite3.Error as error:
         conn.rollback()
+        if stored_screenshot is not None:
+            try:
+                stored_screenshot.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                return (
+                    False,
+                    f"Could not submit bug report: {error} "
+                    f"(could not remove copied screenshot: {cleanup_error})",
+                    None,
+                )
         return False, f"Could not submit bug report: {error}", None
     finally:
         conn.close()
+
+
+def _store_bug_screenshot(source_path):
+    source = Path(source_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"Screenshot file was not found: {source}")
+
+    try:
+        with Image.open(source) as image:
+            image_format = image.format
+            image.verify()
+    except Image.DecompressionBombError as error:
+        raise ValueError(f"Screenshot image is too large to process: {error}") from error
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Selected file is not a valid image: {error}") from error
+
+    suffix_by_format = {
+        "BMP": ".bmp",
+        "GIF": ".gif",
+        "JPEG": ".jpg",
+        "PNG": ".png",
+        "TIFF": ".tiff",
+        "WEBP": ".webp",
+    }
+    suffix = suffix_by_format.get(image_format)
+    if suffix is None:
+        raise ValueError(
+            "Unsupported screenshot format. Choose PNG, JPEG, GIF, BMP, TIFF, or WebP."
+        )
+
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    destination = SCREENSHOT_DIR / f"{uuid.uuid4().hex}{suffix}"
+    try:
+        shutil.copy2(source, destination)
+    except OSError as error:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            raise OSError(
+                f"{error} (could not remove partial screenshot copy: {cleanup_error})"
+            ) from error
+        raise
+    return destination, destination.relative_to(APP_DIR).as_posix()
+
+
+def _resolve_screenshot_path(screenshot_path):
+    value = (screenshot_path or "").strip()
+    if not value:
+        return None
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+
+    candidates = (Path.cwd() / path, APP_DIR / path)
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
 
 
 def logout():
@@ -1005,18 +1089,91 @@ def show_bug_report_details(report_id, username, role):
         ("Steps to Reproduce", "steps_to_reproduce"),
         ("Expected Result", "expected_result"),
         ("Actual Result", "actual_result"),
-        ("Screenshot Path", "screenshot"),
     ):
         ctk.CTkLabel(
             content, text=f"{heading}\n{report.get(key) or 'Not provided'}",
             font=("Segoe UI", 11), text_color=TEXT_MUTED,
             wraplength=570, justify="left", anchor="w",
         ).pack(anchor="w", padx=18, pady=(0, 14))
+
+    ctk.CTkLabel(
+        content, text="Screenshot", font=("Segoe UI", 11, "bold"),
+        text_color=TEXT_WHITE, anchor="w",
+    ).pack(anchor="w", padx=18, pady=(0, 6))
+    screenshot_path = _resolve_screenshot_path(report.get("screenshot"))
+    screenshot_exists = screenshot_path is not None and screenshot_path.is_file()
+    preview = None
+    if screenshot_path is None:
+        preview = ctk.CTkLabel(
+            content, text="No screenshot attached",
+            font=("Segoe UI", 10), text_color=TEXT_MUTED, anchor="w",
+        )
+    elif not screenshot_exists:
+        preview = ctk.CTkLabel(
+            content, text="Screenshot file is missing; it may have been moved or deleted.",
+            font=("Segoe UI", 10), text_color="#F87171", anchor="w",
+        )
+    else:
+        try:
+            with Image.open(screenshot_path) as source_image:
+                thumbnail = source_image.copy()
+                thumbnail.thumbnail((520, 320), Image.Resampling.LANCZOS)
+                if thumbnail.mode not in ("RGB", "RGBA"):
+                    thumbnail = thumbnail.convert("RGB")
+            screenshot_image = ctk.CTkImage(
+                light_image=thumbnail,
+                dark_image=thumbnail,
+                size=thumbnail.size,
+            )
+            preview = ctk.CTkLabel(
+                content, text="", image=screenshot_image, cursor="hand2",
+            )
+            preview.image = screenshot_image
+            preview.bind(
+                "<Button-1>",
+                lambda _event, path=screenshot_path: _open_screenshot(path, window),
+            )
+        except (OSError, ValueError, Image.DecompressionBombError):
+            preview = ctk.CTkLabel(
+                content, text="This file is not a supported or valid image.",
+                font=("Segoe UI", 10), text_color="#F87171", anchor="w",
+            )
+    preview.pack(anchor="w", padx=18, pady=(0, 10))
+    ctk.CTkButton(
+        content, text="Open Full Screenshot",
+        fg_color=BG_BUTTON_SECONDARY, hover_color=BG_BUTTON_SECONDARY_HOVER,
+        text_color=TEXT_WHITE,
+        command=lambda path=screenshot_path: _open_screenshot(path, window),
+        state="normal" if screenshot_exists else "disabled",
+    ).pack(anchor="w", padx=18, pady=(0, 14))
     ctk.CTkButton(
         content, text="Close", fg_color=BG_BUTTON_SECONDARY,
         hover_color=BG_BUTTON_SECONDARY_HOVER, text_color=TEXT_WHITE,
         command=window.destroy,
     ).pack(anchor="w", padx=18, pady=(0, 18))
+
+
+def _open_screenshot(path, parent):
+    if path is None or not path.is_file():
+        messagebox.showerror(
+            "Screenshot Unavailable",
+            "The screenshot file is missing or unavailable.",
+            parent=parent,
+        )
+        return
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except (OSError, subprocess.SubprocessError) as error:
+        messagebox.showerror(
+            "Could Not Open Screenshot",
+            f"The screenshot could not be opened: {error}",
+            parent=parent,
+        )
 
 
 def show_tester_bug_reports():

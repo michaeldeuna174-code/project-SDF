@@ -1,5 +1,3 @@
-"""Embedded Tester bug-report form; persistence is provided by the host."""
-
 import sqlite3
 from collections.abc import Callable
 from typing import Any
@@ -187,7 +185,7 @@ class BugReportForm(ctk.CTkFrame):
             parent=self.winfo_toplevel(),
             title="Attach screenshot",
             filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp"),
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.webp"),
                 ("All files", "*.*"),
             ],
         )

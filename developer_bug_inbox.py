@@ -1,5 +1,3 @@
-"""Embedded Developer inbox scoped to reports for owned prototypes."""
-
 import sqlite3
 from collections.abc import Callable
 from typing import Any

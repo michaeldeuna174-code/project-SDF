@@ -1,5 +1,3 @@
-"""Embedded, account-scoped bug-report list."""
-
 import sqlite3
 from collections.abc import Callable
 from typing import Any
