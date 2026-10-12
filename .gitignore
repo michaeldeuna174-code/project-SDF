@@ -1,7 +1,6 @@
-# Local SQLite databases stay machine-specific (recreated by init code)
 *.db
 *.db-journal
 
-# Python caches and bytecode
+
 __pycache__/
 *.pyc
