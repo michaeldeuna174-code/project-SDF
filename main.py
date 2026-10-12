@@ -1,5 +1,8 @@
 import os
 import shutil
+import hashlib
+import hmac
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +13,7 @@ import tkinter as tk
 from tkinter import messagebox
 import customtkinter as ctk
 from PIL import Image
+from database import _validate_inputs, hash_password, verify_password
 from bug_report_form import BugReportForm
 from bug_report_list import BugReportList
 from developer_bug_inbox import DeveloperBugInbox
@@ -51,6 +55,16 @@ def init_db():
             role TEXT
         )
     """)
+
+    existing_user_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "recovery_code_hash" not in existing_user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN recovery_code_hash TEXT")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_recovery_code_hash "
+        "ON users(recovery_code_hash)"
+    )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bugs (
@@ -133,15 +147,17 @@ def login(username, password):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT username, role FROM users WHERE username = ? AND password = ?",
-        (username, password)
+        "SELECT username, role, password FROM users WHERE username = ?",
+        (username,)
     )
 
     user = cursor.fetchone()
-
     conn.close()
 
-    if user:
+    if user and (
+        verify_password(user[2], password or "")
+        or user[2] == password
+    ):
         return user[0], user[1]
 
     return None, None
@@ -159,6 +175,7 @@ def register_user(username, password, role):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
+    cursor.execute("BEGIN IMMEDIATE")
     cursor.execute(
         "SELECT id FROM users WHERE username = ?",
         (username,)
@@ -166,17 +183,87 @@ def register_user(username, password, role):
 
     if cursor.fetchone() is not None:
         conn.close()
-        return False, "Username already exists. Please choose another one."
+        return False, "Username already exists. Please choose another one.", None
 
     try:
+        while True:
+            recovery_code = secrets.token_urlsafe(24)
+            recovery_code_hash = hashlib.sha256(
+                recovery_code.encode("utf-8")
+            ).hexdigest()
+            cursor.execute(
+                "SELECT 1 FROM users WHERE recovery_code_hash = ?",
+                (recovery_code_hash,),
+            )
+            if cursor.fetchone() is None:
+                break
+
         cursor.execute(
-            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-            (username, password, role)
+            "INSERT INTO users (username, password, role, recovery_code_hash) "
+            "VALUES (?, ?, ?, ?)",
+            (username, password, role, recovery_code_hash)
         )
         conn.commit()
-        return True, "Account created successfully!"
+        return True, "Account created successfully!", recovery_code
     except sqlite3.IntegrityError:
-        return False, "Username already exists. Please choose another one."
+        return False, "Username already exists. Please choose another one.", None
+    finally:
+        conn.close()
+
+
+def _recovery_code_hash(recovery_code):
+    return hashlib.sha256(recovery_code.encode("utf-8")).hexdigest()
+
+
+def verify_recovery_code(username, recovery_code):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        row = conn.execute(
+            "SELECT recovery_code_hash FROM users WHERE username = ?",
+            ((username or "").strip(),),
+        ).fetchone()
+        if row is None or not row[0] or not recovery_code:
+            return False
+        return hmac.compare_digest(
+            _recovery_code_hash(recovery_code.strip()), row[0]
+        )
+    finally:
+        conn.close()
+
+
+def reset_password(username, recovery_code, new_password):
+    username = (username or "").strip()
+    recovery_code = (recovery_code or "").strip()
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, recovery_code_hash FROM users WHERE username = ?",
+            (username,),
+        )
+        row = cursor.fetchone()
+        if (
+            row is None
+            or not row[1]
+            or not recovery_code
+            or not hmac.compare_digest(_recovery_code_hash(recovery_code), row[1])
+        ):
+            return False, "Invalid username or recovery code."
+
+        validation_error = _validate_inputs(username, new_password, row[0])
+        if validation_error:
+            return False, validation_error
+
+        cursor.execute(
+            "UPDATE users SET password = ?, recovery_code_hash = NULL "
+            "WHERE username = ? AND recovery_code_hash = ?",
+            (hash_password(new_password), username, row[1]),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False, "The recovery code is no longer valid."
+        conn.commit()
+        return True, "Password reset successfully."
     finally:
         conn.close()
 
@@ -741,6 +828,15 @@ def show_login():
     )
     password_entry.pack(fill="x", padx=42, pady=(5, 8))
 
+    forgot_password_label = ctk.CTkLabel(
+        panel, text="Forgot Password?", font=("Segoe UI", 9),
+        text_color=ACCENT_CYAN, cursor="hand2",
+    )
+    forgot_password_label.pack(anchor="e", padx=42, pady=(0, 4))
+    forgot_password_label.bind(
+        "<Button-1>", lambda _event: show_forgot_password()
+    )
+
     error_label = ctk.CTkLabel(
         panel, text="", font=("Segoe UI", 9),
         text_color="#F87171", wraplength=340, justify="center"
@@ -793,6 +889,196 @@ def show_login():
 
     username_entry.bind("<Return>", lambda e: do_login())
     password_entry.bind("<Return>", lambda e: do_login())
+
+
+def _show_recovery_code(username, role, recovery_code):
+    dialog = ctk.CTkToplevel(root)
+    dialog.title("Save Your Recovery Code")
+    dialog.geometry("500x270")
+    dialog.resizable(False, False)
+    dialog.configure(fg_color=BG_NAVY)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    panel = ctk.CTkFrame(
+        dialog, fg_color=BG_PANEL, corner_radius=20,
+        border_width=1, border_color=BG_BORDER,
+    )
+    panel.pack(fill="both", expand=True, padx=18, pady=18)
+    ctk.CTkLabel(
+        panel, text="Save Your Recovery Code",
+        font=("Segoe UI", 18, "bold"), text_color=TEXT_WHITE,
+    ).pack(padx=22, pady=(20, 4))
+    ctk.CTkLabel(
+        panel,
+        text=f"Account: {username} ({role})\nSave this code securely. It is shown only once.",
+        font=("Segoe UI", 10), text_color=TEXT_MUTED, justify="center",
+    ).pack(padx=22, pady=(0, 12))
+
+    code_entry = ctk.CTkEntry(
+        panel, font=("Segoe UI", 12), width=350, height=38,
+        fg_color=BG_INPUT, text_color=TEXT_WHITE,
+        border_color=BG_BORDER, corner_radius=10,
+        justify="center",
+    )
+    code_entry.pack(padx=22, pady=(0, 10))
+    code_entry.insert(0, recovery_code)
+    code_entry.configure(state="readonly")
+
+    status_label = ctk.CTkLabel(
+        panel, text="You need this code to reset your password.",
+        font=("Segoe UI", 9), text_color=ACCENT_CYAN,
+    )
+    status_label.pack(pady=(0, 8))
+
+    def copy_code():
+        try:
+            dialog.clipboard_clear()
+            dialog.clipboard_append(recovery_code)
+            dialog.update()
+            status_label.configure(text="Recovery code copied. Store it somewhere safe.")
+        except tk.TclError as error:
+            status_label.configure(text=f"Could not copy recovery code: {error}")
+
+    actions = ctk.CTkFrame(panel, fg_color="transparent")
+    actions.pack(pady=(0, 14))
+    ctk.CTkButton(
+        actions, text="Copy", width=110,
+        fg_color=ACCENT_BLUE, hover_color=ACCENT_BLUE_HOVER,
+        text_color=TEXT_WHITE, command=copy_code,
+    ).pack(side="left", padx=5)
+    ctk.CTkButton(
+        actions, text="Continue", width=110,
+        fg_color=BG_BUTTON_SECONDARY, hover_color=BG_BUTTON_SECONDARY_HOVER,
+        text_color=TEXT_WHITE, command=dialog.destroy,
+    ).pack(side="left", padx=5)
+
+
+def show_forgot_password():
+    dialog = ctk.CTkToplevel(root)
+    dialog.title("Forgot Password")
+    dialog.geometry("500x610")
+    dialog.resizable(False, False)
+    dialog.configure(fg_color=BG_NAVY)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    panel = ctk.CTkFrame(
+        dialog, fg_color=BG_PANEL, corner_radius=20,
+        border_width=1, border_color=BG_BORDER,
+    )
+    panel.pack(fill="both", expand=True, padx=18, pady=18)
+    ctk.CTkLabel(
+        panel, text="Reset Password",
+        font=("Segoe UI", 20, "bold"), text_color=TEXT_WHITE,
+    ).pack(padx=38, pady=(22, 4))
+    ctk.CTkLabel(
+        panel, text="Enter your username and recovery code to continue.",
+        font=("Segoe UI", 10), text_color=TEXT_MUTED,
+    ).pack(padx=30, pady=(0, 16))
+
+    ctk.CTkLabel(
+        panel, text="Username", font=("Segoe UI", 10, "bold"),
+        text_color=TEXT_WHITE,
+    ).pack(anchor="w", padx=38)
+    username_entry = ctk.CTkEntry(
+        panel, font=("Segoe UI", 10), width=340, height=38,
+        fg_color=BG_INPUT, text_color=TEXT_WHITE,
+        border_color=BG_BORDER, corner_radius=10,
+    )
+    username_entry.pack(fill="x", padx=38, pady=(3, 9))
+
+    ctk.CTkLabel(
+        panel, text="Recovery Code", font=("Segoe UI", 10, "bold"),
+        text_color=TEXT_WHITE,
+    ).pack(anchor="w", padx=38)
+    recovery_entry = ctk.CTkEntry(
+        panel, font=("Segoe UI", 10), width=340, height=38,
+        fg_color=BG_INPUT, text_color=TEXT_WHITE,
+        border_color=BG_BORDER, corner_radius=10,
+    )
+    recovery_entry.pack(fill="x", padx=38, pady=(3, 9))
+
+    error_label = ctk.CTkLabel(
+        panel, text="", font=("Segoe UI", 9),
+        text_color="#F87171", wraplength=350, justify="center",
+    )
+    error_label.pack(padx=38, pady=(0, 8))
+
+    reset_fields = ctk.CTkFrame(panel, fg_color="transparent")
+    reset_fields.pack(fill="x", padx=38)
+
+    def verify_code():
+        username = username_entry.get().strip()
+        recovery_code = recovery_entry.get().strip()
+        if not username or not recovery_code:
+            error_label.configure(text="Enter both your username and recovery code.")
+            return
+        if not verify_recovery_code(username, recovery_code):
+            error_label.configure(text="Invalid username or recovery code.")
+            return
+
+        error_label.configure(text="Recovery code verified. Choose a new password.", text_color=ACCENT_CYAN)
+        username_entry.configure(state="disabled")
+        recovery_entry.configure(state="disabled")
+        verify_button.configure(state="disabled")
+
+        ctk.CTkLabel(
+            reset_fields, text="New Password", font=("Segoe UI", 10, "bold"),
+            text_color=TEXT_WHITE,
+        ).pack(anchor="w")
+        new_password_entry = ctk.CTkEntry(
+            reset_fields, font=("Segoe UI", 10), width=340, height=38, show="*",
+            fg_color=BG_INPUT, text_color=TEXT_WHITE,
+            border_color=BG_BORDER, corner_radius=10,
+        )
+        new_password_entry.pack(fill="x", pady=(3, 9))
+        ctk.CTkLabel(
+            reset_fields, text="Confirm New Password",
+            font=("Segoe UI", 10, "bold"), text_color=TEXT_WHITE,
+        ).pack(anchor="w")
+        confirm_password_entry = ctk.CTkEntry(
+            reset_fields, font=("Segoe UI", 10), width=340, height=38, show="*",
+            fg_color=BG_INPUT, text_color=TEXT_WHITE,
+            border_color=BG_BORDER, corner_radius=10,
+        )
+        confirm_password_entry.pack(fill="x", pady=(3, 10))
+
+        def save_password():
+            new_password = new_password_entry.get()
+            confirm_password = confirm_password_entry.get()
+            if new_password != confirm_password:
+                error_label.configure(text="Passwords do not match.")
+                return
+            success, message = reset_password(
+                username, recovery_code, new_password
+            )
+            if not success:
+                error_label.configure(text=message)
+                return
+            messagebox.showinfo(
+                "Password Reset", message, parent=dialog
+            )
+            dialog.destroy()
+
+        ctk.CTkButton(
+            reset_fields, text="Reset Password", height=40,
+            fg_color=ACCENT_TEAL, hover_color=ACCENT_TEAL_HOVER,
+            text_color=TEXT_WHITE, command=save_password,
+        ).pack(fill="x", pady=(2, 8))
+        new_password_entry.focus_set()
+
+    verify_button = ctk.CTkButton(
+        panel, text="Verify Recovery Code", height=40,
+        fg_color=ACCENT_BLUE, hover_color=ACCENT_BLUE_HOVER,
+        text_color=TEXT_WHITE, command=verify_code,
+    )
+    verify_button.pack(fill="x", padx=38, pady=(0, 8))
+    ctk.CTkButton(
+        panel, text="Cancel", height=38,
+        fg_color=BG_BUTTON_SECONDARY, hover_color=BG_BUTTON_SECONDARY_HOVER,
+        text_color=TEXT_WHITE, command=dialog.destroy,
+    ).pack(fill="x", padx=38, pady=(0, 18))
 
 
 def show_register():
@@ -930,15 +1216,14 @@ def show_register():
             error_label.configure(text="Please select a role (Tester or Developer).")
             return
 
-        ok, msg = register_user(username, password, role)
+        ok, msg, recovery_code = register_user(username, password, role)
 
         if not ok:
             error_label.configure(text=msg)
             return
 
-        error_label.configure(text="")
-        messagebox.showinfo("Registration Successful", f"{msg}\nYou can now log in as {username} ({role}).")
         show_login()
+        _show_recovery_code(username, role, recovery_code)
 
     create_btn = ctk.CTkButton(
         panel, text="Create Account", command=do_register,
