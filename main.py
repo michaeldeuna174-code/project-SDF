@@ -25,7 +25,7 @@ DB_FILE = "game.tracker.db"
 APP_DIR = Path(__file__).resolve().parent
 SCREENSHOT_DIR = APP_DIR / "uploads" / "bug_screenshots"
 
-# Color palette
+
 BG_NAVY = "#0B1120"
 BG_HEADER = "#111C30"
 BG_PANEL = "#17263D"
